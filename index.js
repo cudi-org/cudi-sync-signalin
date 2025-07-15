@@ -7,16 +7,16 @@ console.log(`🔌 Signaling server escuchando en puerto ${PORT}...`);
 const rooms = new Map();
 
 wss.on("connection", (ws) => {
-  ws.roomId = null; // Inicializa roomId para cada nueva conexión
+  ws.roomId = null;
 
   ws.on("message", (message) => {
     try {
       const msg = JSON.parse(message);
 
       switch (msg.type) {
-        case "join": // Espera 'join' para unirse a una sala
+        case "join":
           {
-            const roomId = msg.room; // Espera 'room' como ID de la sala
+            const roomId = msg.room;
             ws.roomId = roomId;
 
             if (!rooms.has(roomId)) {
@@ -30,7 +30,6 @@ wss.on("connection", (ws) => {
               `Usuario unido a la sala ${roomId}. Total en sala: ${clients.size}`
             );
 
-            // Si hay 2 clientes en la sala, notifica que están listos para la conexión WebRTC
             if (clients.size === 2) {
               clients.forEach((client) => {
                 if (client.readyState === WebSocket.OPEN) {
@@ -41,7 +40,7 @@ wss.on("connection", (ws) => {
           }
           break;
 
-        case "signal": // Espera 'signal' para retransmitir los datos de señalización (ofertas, respuestas, candidatos)
+        case "signal":
           {
             const roomId = ws.roomId;
             if (!roomId) {
@@ -55,7 +54,6 @@ wss.on("connection", (ws) => {
               return;
             }
 
-            // Reenvía el mensaje de señalización a los otros clientes en la misma sala
             clients.forEach((client) => {
               if (client !== ws && client.readyState === WebSocket.OPEN) {
                 client.send(JSON.stringify(msg)); // Envía el mensaje 'signal' completo tal cual
