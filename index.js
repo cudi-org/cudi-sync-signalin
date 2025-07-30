@@ -1,14 +1,12 @@
 const WebSocket = require("ws");
-const PORT = process.env.PORT || 3000; // Usa el puerto proporcionado por Render o 3000 por defecto
+const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({ port: PORT });
 
 console.log(`🔌 Signaling server escuchando en puerto ${PORT}...`);
 
-// Mapa para almacenar las salas. Cada sala es un Set de clientes WebSocket.
 const rooms = new Map();
 
 wss.on("connection", (ws) => {
-  // Inicializa roomId como null para cada nueva conexión
   ws.roomId = null;
 
   ws.on("message", (message) => {
@@ -24,7 +22,7 @@ wss.on("connection", (ws) => {
       case "join":
         {
           const roomId = msg.room;
-          ws.roomId = roomId; // Asigna la sala al objeto WebSocket para futuras referencias
+          ws.roomId = roomId;
 
           if (!rooms.has(roomId)) {
             rooms.set(roomId, new Set());
@@ -35,7 +33,6 @@ wss.on("connection", (ws) => {
 
           console.log(`Usuario unido a la sala ${roomId}. Total en sala: ${clients.size}`);
 
-          // Si hay dos clientes en la sala, ambos están listos para WebRTC
           if (clients.size === 2) {
             clients.forEach((client) => {
               if (client.readyState === WebSocket.OPEN) {
@@ -61,11 +58,9 @@ wss.on("connection", (ws) => {
             return;
           }
 
-          // Retransmite el mensaje 'signal' al otro cliente en la misma sala
           clients.forEach((client) => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify(msg)); // Envía el mensaje 'signal' completo tal cual
-              // --- ¡ESTE ES EL LOG CRÍTICO PARA DEPURACIÓN! ---
+              client.send(JSON.stringify(msg));
               console.log(
                 `<<< SERVER LOG >>> Retransmitiendo señal de un cliente a otro en sala ${roomId}. Contenido (primeros 100 chars): ${JSON.stringify(msg.data).substring(0, 100)}...`
               );
@@ -86,7 +81,6 @@ wss.on("connection", (ws) => {
               rooms.delete(roomId);
               console.log(`Sala ${roomId} vacía y eliminada.`);
             } else {
-              // Notifica a los clientes restantes que alguien se fue
               clients.forEach((client) => {
                 if (client.readyState === WebSocket.OPEN) {
                   client.send(JSON.stringify({ type: "cerrar", reason: "peer_left" }));
@@ -115,7 +109,6 @@ wss.on("connection", (ws) => {
         rooms.delete(roomId);
         console.log(`Sala ${roomId} vacía y eliminada por desconexión.`);
       } else {
-        // Notifica a los clientes restantes que el par se desconectó inesperadamente
         clients.forEach((client) => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({ type: "cerrar", reason: "peer_disconnected" }));
