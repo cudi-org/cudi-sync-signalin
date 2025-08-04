@@ -1,159 +1,161 @@
 const WebSocket = require('ws');
 
-const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocket.Server({ port: PORT });
+const appClients = new Map();
+const syncRooms = new Map();
 
-const appClients = {
-    'cudi-sync': {},
-    'cudi-messenger': new Map()
-};
+console.log(`Servidor de señalización multipropósito iniciado en el puerto ${PORT}`);
 
 wss.on('connection', ws => {
     console.log('Cliente conectado');
 
-    ws.on('message', message => {
-        const parsedMessage = JSON.parse(message);
-        const { type, room, appType, senderId, data } = parsedMessage;
+    ws.id = Math.random().toString(36).substring(2, 15);
+    console.log(`Cliente temporal ID: ${ws.id}`);
 
-        if (!appType) {
-            console.warn('Mensaje recibido sin appType. Ignorando:', parsedMessage);
+    ws.on('message', message => {
+        let data;
+        try {
+            data = JSON.parse(message);
+        } catch (e) {
+            console.error('Error al parsear el mensaje JSON:', e, 'Mensaje:', message);
             return;
         }
 
-        switch (appType) {
-            case 'cudi-sync':
-                console.log(`[CUDI Sync] Mensaje recibido: ${type} en sala: ${room}`);
-                switch (type) {
-                    case 'join':
-                        appClients['cudi-sync'][room] = ws;
-                        ws.currentSyncRoom = room;
-                        console.log(`[CUDI Sync] Cliente ${room} se ha unido.`);
-                        break;
-                    case 'signal':
-                        const targetSyncClientWs = appClients['cudi-sync'][room];
-                        if (targetSyncClientWs && targetSyncClientWs.readyState === WebSocket.OPEN) {
-                            targetSyncClientWs.send(JSON.stringify(parsedMessage));
-                            console.log(`[CUDI Sync] Señal reenviada a ${room} desde ${senderId || 'desconocido'}.`);
-                        } else {
-                            console.warn(`[CUDI Sync] Cliente ${room} no encontrado o no está abierto.`);
-                        }
-                        break;
-                    case 'ready':
-                        break;
-                    case 'cerrar':
-                        const syncClosedTargetWs = appClients['cudi-sync'][room];
-                        if (syncClosedTargetWs && syncClosedTargetWs.readyState === WebSocket.OPEN) {
-                            syncClosedTargetWs.send(JSON.stringify({ type: "cerrar", reason: "peer_closed" }));
-                        }
-                        break;
-                    default:
-                        console.log(`[CUDI Sync] Tipo de mensaje desconocido: ${type}`);
-                }
-                break;
+        const appType = data.appType || 'default';
+        const senderId = data.senderPeerId || ws.peerId || ws.id;
 
-            case 'cudi-messenger':
-                console.log(`[CUDI Messenger] Mensaje recibido: ${type} en sala: ${room}`);
-                switch (type) {
-                    case 'join':
-                        if (!room) {
-                            console.warn("[CUDI Messenger] Mensaje 'join' sin room. Ignorando.");
-                            return;
-                        }
-                        if (!appClients['cudi-messenger'].has(room)) {
-                            appClients['cudi-messenger'].set(room, new Set());
-                        }
-                        const messengerRoomClients = appClients['cudi-messenger'].get(room);
-                        messengerRoomClients.add(ws);
-                        ws.currentMessengerRoom = room;
-                        console.log(`[CUDI Messenger] Cliente se unió a la sala: ${room}. Clientes en sala: ${messengerRoomClients.size}`);
+        console.log(`[${appType}] Mensaje recibido: ${data.type} de ${senderId} a ${data.targetPeerId || data.room || 'sin objetivo'}`);
 
-                        if (messengerRoomClients.size === 2) {
-                            messengerRoomClients.forEach(client => {
-                                if (client.readyState === WebSocket.OPEN) {
-                                    client.send(JSON.stringify({ type: "ready", room: room, appType: 'cudi-messenger' }));
-                                }
-                            });
-                        } else if (messengerRoomClients.size > 2) {
-                            console.warn(`[CUDI Messenger] Advertencia: Más de 2 clientes en la sala ${room}.`);
-                        }
-                        break;
-
-                    case 'signal':
-                        if (!room) {
-                            console.warn("[CUDI Messenger] Mensaje 'signal' sin room. Ignorando.");
-                            return;
-                        }
-                        const clientsInTargetMessengerRoom = appClients['cudi-messenger'].get(room);
-                        if (clientsInTargetMessengerRoom) {
-                            clientsInTargetMessengerRoom.forEach(client => {
-                                if (client !== ws && client.readyState === WebSocket.OPEN) {
-                                    client.send(JSON.stringify({
-                                        type: "signal",
-                                        room: room,
-                                        senderId: senderId,
-                                        data: data,
-                                        appType: 'cudi-messenger'
-                                    }));
-                                }
-                            });
-                        } else {
-                            console.warn(`[CUDI Messenger] Sala ${room} no encontrada para señalización.`);
-                        }
-                        break;
-                    
-                    case 'cerrar':
-                         if (!room) {
-                             console.warn("[CUDI Messenger] Mensaje 'cerrar' sin room. Ignorando.");
-                             return;
-                         }
-                         const messengerClosingRoomClients = appClients['cudi-messenger'].get(room);
-                         if (messengerClosingRoomClients) {
-                             messengerClosingRoomClients.forEach(client => {
-                                 if (client !== ws && client.readyState === WebSocket.OPEN) {
-                                     client.send(JSON.stringify({ type: "cerrar", room: room, reason: "peer_disconnected", appType: 'cudi-messenger' }));
-                                 }
-                             });
-                         }
-                         break;
-
-                    default:
-                        console.log(`[CUDI Messenger] Tipo de mensaje desconocido: ${type}`);
-                }
-                break;
-
-            default:
-                console.warn(`appType desconocido: ${appType}. Mensaje ignorado.`);
+        if (appType === 'cudi-messenger') {
+            handleMessengerLogic(ws, data, message);
+        } 
+        else if (appType === 'cudi-sync') {
+            handleSyncLogic(ws, data, message);
+        }
+        else {
+            console.warn(`[${appType}] Tipo de mensaje desconocido: ${data.type}`);
         }
     });
 
     ws.on('close', () => {
-        console.log('Cliente desconectado');
-        if (ws.currentSyncRoom && appClients['cudi-sync'][ws.currentSyncRoom]) {
-            console.log(`[CUDI Sync] Cliente ${ws.currentSyncRoom} removido.`);
-            delete appClients['cudi-sync'][ws.currentSyncRoom];
-        }
+        const closedPeerId = ws.peerId;
+        const closedAppType = ws.appType || 'default';
 
-        if (ws.currentMessengerRoom && appClients['cudi-messenger'].has(ws.currentMessengerRoom)) {
-            const roomClients = appClients['cudi-messenger'].get(ws.currentMessengerRoom);
-            roomClients.delete(ws);
-            console.log(`[CUDI Messenger] Cliente removido de sala: ${ws.currentMessengerRoom}. Clientes restantes: ${roomClients.size}`);
+        console.log(`Cliente desconectado: ${closedPeerId || ws.id} (App: ${closedAppType})`);
 
-            if (roomClients.size === 0) {
-                appClients['cudi-messenger'].delete(ws.currentMessengerRoom);
-                console.log(`[CUDI Messenger] Sala ${ws.currentMessengerRoom} ahora está vacía y ha sido eliminada.`);
-            } else {
-                roomClients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: "cerrar", room: ws.currentMessengerRoom, reason: "peer_disconnected", appType: 'cudi-messenger' }));
-                    }
-                });
+        if (closedAppType === 'cudi-messenger') {
+            const clients = appClients.get(closedAppType);
+            if (clients && clients.has(closedPeerId)) {
+                clients.delete(closedPeerId);
+                console.log(`[${closedAppType}] Cliente ${closedPeerId} removido. Clientes restantes: ${clients.size}`);
+                if (clients.size === 0) {
+                    appClients.delete(closedAppType);
+                }
+            }
+        } else if (closedAppType === 'cudi-sync') {
+            const room = ws.room;
+            if (room && syncRooms.has(room)) {
+                const roomClients = syncRooms.get(room);
+                roomClients.delete(ws);
+                console.log(`[${closedAppType}] Cliente removido de sala: ${room}. Clientes restantes: ${roomClients.size}`);
+
+                if (roomClients.size === 0) {
+                    syncRooms.delete(room);
+                    console.log(`[${closedAppType}] Sala ${room} ahora está vacía y ha sido eliminada.`);
+                }
             }
         }
     });
 
     ws.on('error', error => {
-        console.error('Error de WebSocket:', error);
+        console.error(`Error del WebSocket para ${ws.peerId || ws.id} (App: ${ws.appType || 'unknown'}):`, error);
     });
 });
 
-console.log('Servidor WebSocket iniciado en el puerto', process.env.PORT || 8080);
+function handleMessengerLogic(ws, data, message) {
+    const clients = appClients.get('cudi-messenger') || new Map();
+    appClients.set('cudi-messenger', clients);
+    
+    switch (data.type) {
+        case 'register':
+            if (data.peerId) {
+                if (clients.has(data.peerId) && clients.get(data.peerId) !== ws) {
+                    console.warn(`[cudi-messenger] Peer ID ${data.peerId} ya está en uso. Desconectando cliente antiguo.`);
+                    clients.get(data.peerId).close(1008, 'Peer ID en uso');
+                }
+                clients.set(data.peerId, ws);
+                ws.peerId = data.peerId;
+                ws.appType = 'cudi-messenger';
+                ws.send(JSON.stringify({ type: 'registered', peerId: data.peerId, appType: 'cudi-messenger' }));
+                console.log(`[cudi-messenger] Cliente registrado: ${data.peerId}. Clientes activos: ${clients.size}`);
+            } else {
+                console.warn('[cudi-messenger] Mensaje de registro sin peerId.');
+            }
+            break;
+        case 'offer':
+        case 'answer':
+        case 'candidate':
+        case 'public-key-exchange':
+            if (data.targetPeerId && clients.has(data.targetPeerId)) {
+                const targetWs = clients.get(data.targetPeerId);
+                if (targetWs.readyState === WebSocket.OPEN) {
+                    targetWs.send(message); 
+                    console.log(`[cudi-messenger] Retransmitido ${data.type} de ${data.senderPeerId} a ${data.targetPeerId}`);
+                } else {
+                    console.warn(`[cudi-messenger] Cliente objetivo ${data.targetPeerId} no está listo para recibir mensajes.`);
+                }
+            } else {
+                console.warn(`[cudi-messenger] Mensaje ${data.type} sin targetPeerId o targetPeerId desconocido: ${data.targetPeerId}`);
+            }
+            break;
+        default:
+            console.warn(`[cudi-messenger] Tipo de mensaje desconocido: ${data.type}`);
+    }
+}
 
+function handleSyncLogic(ws, data, message) {
+    switch (data.type) {
+        case 'join':
+            if (data.room) {
+                if (!syncRooms.has(data.room)) {
+                    syncRooms.set(data.room, new Set());
+                }
+                const roomClients = syncRooms.get(data.room);
+                roomClients.add(ws);
+                ws.room = data.room;
+                ws.appType = 'cudi-sync';
+                console.log(`[cudi-sync] Cliente se unió a la sala: ${data.room}. Clientes en sala: ${roomClients.size}`);
+
+                if (roomClients.size === 2) {
+                    const clientsInRoom = Array.from(roomClients);
+                    const offerer = clientsInRoom[0];
+                    const receiver = clientsInRoom[1];
+
+                    if (offerer.readyState === WebSocket.OPEN) {
+                        offerer.send(JSON.stringify({ type: 'start_negotiation', appType: 'cudi-sync' }));
+                    }
+
+                    console.log(`[cudi-sync] Dos clientes en sala ${data.room}. Iniciando negociación.`);
+                }
+            } else {
+                console.warn('[cudi-sync] Mensaje de join sin room.');
+            }
+            break;
+        case 'signal':
+            if (data.room && syncRooms.has(data.room)) {
+                const roomClients = syncRooms.get(data.room);
+                roomClients.forEach(client => {
+                    if (client !== ws && client.readyState === WebSocket.OPEN) {
+                        client.send(message);
+                    }
+                });
+                console.log(`[cudi-sync] Retransmitido 'signal' en sala ${data.room}`);
+            } else {
+                console.warn(`[cudi-sync] Mensaje de señal sin room o room desconocido: ${data.room}`);
+            }
+            break;
+        default:
+            console.warn(`[cudi-sync] Tipo de mensaje desconocido: ${data.type}`);
+    }
+}
