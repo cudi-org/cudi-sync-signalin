@@ -1,10 +1,14 @@
 {
   "name": "cudi-sync-signaling",
   "version": "1.0.0",
-  "description": "Servidor de señalización para CUDI Sync (WebRTC)",
+  "description": "Signaling server for CUDI Sync (WebRTC)",
   "main": "index.js",
+  "engines": {
+    "node": ">=16.0.0"
+  },
   "scripts": {
     "start": "node index.js",
+    "dev": "node --watch index.js",
     "build": "echo \"No build needed\""
   },
   "dependencies": {
