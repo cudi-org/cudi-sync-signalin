@@ -9,57 +9,45 @@ const syncRooms = new Map();
 
 const MAX_MESSAGE_SIZE = 64 * 1024; 
 const HEARTBEAT_INTERVAL = 30000;
+const TOKEN_TTL = 86400000;
 
-function heartbeat() {
-    this.isAlive = true;
-}
-
-console.log(`[Server] Signaling server started on port ${PORT}`);
+function heartbeat() { this.isAlive = true; }
 
 wss.on('connection', (ws) => {
     ws.isAlive = true;
-    ws.on('pong', heartbeat);
-    
     ws.id = crypto.randomBytes(8).toString('hex');
     ws.isPending = false;
-    console.log(`[Connection] New client connected. ID: ${ws.id}`);
+    ws.isAccepted = false;
+    ws.msgCount = 0;
+    ws.msgTs = Date.now();
+
+    ws.on('pong', heartbeat);
 
     ws.on('message', message => {
-        if (message.length > MAX_MESSAGE_SIZE) {
-            console.warn(`[Security] Message too large from ${ws.id}`);
-            return ws.close(1009, 'Message too large');
+        const now = Date.now();
+        if (now - ws.msgTs > 1000) { 
+            ws.msgTs = now; 
+            ws.msgCount = 0; 
         }
+        if (++ws.msgCount > 30) return ws.close(1011);
+
+        if (typeof message !== 'string') return;
+        if (message.length > MAX_MESSAGE_SIZE) return ws.close(1009);
 
         let data;
-        try {
-            data = JSON.parse(message);
-        } catch (e) {
-            console.error(`[Error] Failed to parse JSON from ${ws.id}`);
-            return;
-        }
+        try { data = JSON.parse(message); } catch (e) { return; }
 
-        const appType = data.appType || 'default';
-
-        if (appType === 'cudi-messenger') {
-            handleMessengerLogic(ws, data, message);
-        } else if (appType === 'cudi-sync') {
-            handleSyncLogic(ws, data, message);
-        }
+        if (data.appType === 'cudi-sync') handleSyncLogic(ws, data, message);
+        else if (data.appType === 'cudi-messenger') handleMessengerLogic(ws, data, message);
     });
 
-    ws.on('close', () => {
-        console.log(`[Connection] Client disconnected: ${ws.id}`);
-        limpiarRecursos(ws);
-    });
+    ws.on('close', () => limpiarRecursos(ws));
 });
 
 function handleSyncLogic(ws, data, message) {
     switch (data.type) {
         case 'join':
-            if (!data.room) {
-                console.warn(`[cudi-sync] Join attempt without room ID from ${ws.id}`);
-                return;
-            }
+            if (!data.room) return;
 
             if (!syncRooms.has(data.room)) {
                 syncRooms.set(data.room, {
@@ -67,89 +55,82 @@ function handleSyncLogic(ws, data, message) {
                     host: ws,
                     password: data.password || null,
                     manualApproval: data.manualApproval || false,
-                    token: crypto.randomBytes(16).toString('hex')
+                    token: crypto.randomBytes(16).toString('hex'),
+                    createdAt: Date.now()
                 });
-
                 ws.room = data.room;
                 ws.isHost = true;
-                const room = syncRooms.get(data.room);
-                room.clients.add(ws);
-
+                ws.isAccepted = true;
+                syncRooms.get(data.room).clients.add(ws);
+                
                 ws.send(JSON.stringify({ 
                     type: 'room_created', 
-                    token: room.token,
+                    token: syncRooms.get(data.room).token,
                     room: data.room 
                 }));
-                console.log(`[cudi-sync] Room created: ${data.room} by ${ws.id}`);
                 return;
             }
 
             const room = syncRooms.get(data.room);
-            const viaToken = (data.token === room.token);
+            const isTokenValid = data.token && (data.token === room.token) && (Date.now() - room.createdAt < TOKEN_TTL);
 
-            if (!viaToken) {
-                if (room.password && data.password !== room.password) {
-                    console.warn(`[Security] Invalid password attempt for room: ${data.room}`);
-                    ws.send(JSON.stringify({ type: 'error', message: 'Invalid password' }));
-                    return;
-                }
-
-                if (room.manualApproval) {
-                    if (room.host && room.host.readyState === WebSocket.OPEN) {
-                        ws.isPending = true;
-                        ws.room = data.room;
-                        room.clients.add(ws);
-                        
-                        room.host.send(JSON.stringify({ 
-                            type: 'approval_request', 
-                            peerId: ws.id, 
-                            alias: data.alias || 'Anonymous' 
-                        }));
-                        console.log(`[cudi-sync] Pending approval for ${ws.id} in room ${data.room}`);
-                        return;
-                    }
-                }
+            if (isTokenValid) {
+                finalizarUnion(ws, room);
+                return;
             }
 
-            finalizarUnion(ws, room);
+            if (room.password && data.password !== room.password) {
+                return ws.send(JSON.stringify({ type: 'error', message: 'Wrong password' }));
+            }
+
+            if (room.manualApproval) {
+                ws.isPending = true;
+                ws.room = data.room;
+                room.clients.add(ws);
+                room.host.send(JSON.stringify({ 
+                    type: 'approval_request', 
+                    peerId: ws.id, 
+                    alias: data.alias || 'Guest' 
+                }));
+            } else {
+                finalizarUnion(ws, room);
+            }
             break;
 
-        case 'approve_user':
-            if (ws.isHost && ws.room && syncRooms.has(ws.room)) {
-                const roomData = syncRooms.get(ws.room);
-                const pendingUser = Array.from(roomData.clients).find(c => c.id === data.peerId);
-                if (pendingUser) {
-                    console.log(`[cudi-sync] Host approved user: ${data.peerId}`);
-                    finalizarUnion(pendingUser, roomData);
-                }
+        case 'approval_response':
+            if (!ws.isHost || !syncRooms.has(ws.room)) return;
+            const targetRoom = syncRooms.get(ws.room);
+            const guest = [...targetRoom.clients].find(c => c.id === data.peerId);
+            
+            if (guest && data.approved) {
+                finalizarUnion(guest, targetRoom);
+                guest.send(JSON.stringify({ type: 'approved' }));
+            } else if (guest) {
+                guest.send(JSON.stringify({ type: 'rejected' }));
+                targetRoom.clients.delete(guest);
+                guest.terminate();
             }
             break;
 
         case 'signal':
-            if (ws.room && !ws.isPending && syncRooms.has(ws.room)) {
-                const roomData = syncRooms.get(ws.room);
-                roomData.clients.forEach(client => {
-                    if (client !== ws && !client.isPending && client.readyState === WebSocket.OPEN) {
-                        client.send(message);
-                    }
-                });
-            }
+            if (!ws.room || ws.isPending || !syncRooms.has(ws.room)) return;
+            const rData = syncRooms.get(ws.room);
+            rData.clients.forEach(client => {
+                if (client !== ws && !client.isPending && client.readyState === WebSocket.OPEN) {
+                    client.send(message);
+                }
+            });
             break;
     }
 }
 
 function finalizarUnion(ws, room) {
     ws.isPending = false;
+    ws.isAccepted = true;
     ws.room = ws.room || Array.from(syncRooms.keys()).find(k => syncRooms.get(k) === room);
     room.clients.add(ws);
-    
     ws.send(JSON.stringify({ type: 'joined', room: ws.room }));
-    console.log(`[cudi-sync] User ${ws.id} joined room: ${ws.room}`);
-
-    if (room.clients.size >= 2) {
-        console.log(`[cudi-sync] Initiating negotiation in room: ${ws.room}`);
-        room.host.send(JSON.stringify({ type: 'start_negotiation' }));
-    }
+    if (room.clients.size >= 2) room.host.send(JSON.stringify({ type: 'start_negotiation' }));
 }
 
 function handleMessengerLogic(ws, data, message) {
@@ -163,7 +144,6 @@ function handleMessengerLogic(ws, data, message) {
                 ws.peerId = data.peerId;
                 ws.appType = 'cudi-messenger';
                 ws.send(JSON.stringify({ type: 'registered', peerId: data.peerId }));
-                console.log(`[cudi-messenger] Client registered: ${data.peerId}`);
             }
             break;
         case 'offer':
@@ -171,9 +151,7 @@ function handleMessengerLogic(ws, data, message) {
         case 'candidate':
             if (data.targetPeerId && clients.has(data.targetPeerId)) {
                 const targetWs = clients.get(data.targetPeerId);
-                if (targetWs.readyState === WebSocket.OPEN) {
-                    targetWs.send(message);
-                }
+                if (targetWs.readyState === WebSocket.OPEN) targetWs.send(message);
             }
             break;
     }
@@ -182,11 +160,13 @@ function handleMessengerLogic(ws, data, message) {
 function limpiarRecursos(ws) {
     if (ws.room && syncRooms.has(ws.room)) {
         const room = syncRooms.get(ws.room);
-        room.clients.delete(ws);
-        console.log(`[Cleanup] Removed ${ws.id} from room ${ws.room}`);
-        if (room.clients.size === 0) {
+        if (ws.isHost) {
+            room.clients.forEach(c => { 
+                if (c !== ws) c.send(JSON.stringify({ type: 'room_closed' })); 
+            });
             syncRooms.delete(ws.room);
-            console.log(`[Cleanup] Deleted empty room: ${ws.room}`);
+        } else {
+            room.clients.delete(ws);
         }
     }
     if (ws.peerId && appClients.has('cudi-messenger')) {
@@ -196,16 +176,10 @@ function limpiarRecursos(ws) {
 
 const interval = setInterval(() => {
     wss.clients.forEach(ws => {
-        if (ws.isAlive === false) {
-            console.log(`[Heartbeat] Terminating inactive connection: ${ws.id}`);
-            return ws.terminate();
-        }
+        if (!ws.isAlive) return ws.terminate();
         ws.isAlive = false;
         ws.ping();
     });
 }, HEARTBEAT_INTERVAL);
 
-wss.on('close', () => {
-    clearInterval(interval);
-    console.log('[Server] Heartbeat interval cleared');
-});
+wss.on('close', () => clearInterval(interval));
