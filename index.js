@@ -31,20 +31,25 @@ wss.on('connection', (ws) => {
         }
         if (++ws.msgCount > 30) return ws.close(1011);
 
-        if (typeof message !== 'string') return;
-        if (message.length > MAX_MESSAGE_SIZE) return ws.close(1009);
+        const messageString = message.toString();
+
+        if (messageString.length > MAX_MESSAGE_SIZE) return ws.close(1009);
 
         let data;
-        try { data = JSON.parse(message); } catch (e) { return; }
+        try { 
+            data = JSON.parse(messageString); 
+        } catch (e) { 
+            return; 
+        }
 
-        if (data.appType === 'cudi-sync') handleSyncLogic(ws, data, message);
-        else if (data.appType === 'cudi-messenger') handleMessengerLogic(ws, data, message);
+        if (data.appType === 'cudi-sync') handleSyncLogic(ws, data, messageString);
+        else if (data.appType === 'cudi-messenger') handleMessengerLogic(ws, data, messageString);
     });
 
     ws.on('close', () => limpiarRecursos(ws));
 });
 
-function handleSyncLogic(ws, data, message) {
+function handleSyncLogic(ws, data, messageString) {
     switch (data.type) {
         case 'join':
             if (!data.room) return;
@@ -72,6 +77,11 @@ function handleSyncLogic(ws, data, message) {
             }
 
             const room = syncRooms.get(data.room);
+
+            if (room.clients.size >= 2) {
+                return ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
+            }
+
             const isTokenValid = data.token && (data.token === room.token) && (Date.now() - room.createdAt < TOKEN_TTL);
 
             if (isTokenValid) {
@@ -117,7 +127,7 @@ function handleSyncLogic(ws, data, message) {
             const rData = syncRooms.get(ws.room);
             rData.clients.forEach(client => {
                 if (client !== ws && !client.isPending && client.readyState === WebSocket.OPEN) {
-                    client.send(message);
+                    client.send(messageString);
                 }
             });
             break;
@@ -133,7 +143,7 @@ function finalizarUnion(ws, room) {
     if (room.clients.size >= 2) room.host.send(JSON.stringify({ type: 'start_negotiation' }));
 }
 
-function handleMessengerLogic(ws, data, message) {
+function handleMessengerLogic(ws, data, messageString) {
     const clients = appClients.get('cudi-messenger') || new Map();
     appClients.set('cudi-messenger', clients);
     
@@ -151,7 +161,7 @@ function handleMessengerLogic(ws, data, message) {
         case 'candidate':
             if (data.targetPeerId && clients.has(data.targetPeerId)) {
                 const targetWs = clients.get(data.targetPeerId);
-                if (targetWs.readyState === WebSocket.OPEN) targetWs.send(message);
+                if (targetWs.readyState === WebSocket.OPEN) targetWs.send(messageString);
             }
             break;
     }
