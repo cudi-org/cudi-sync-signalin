@@ -1,5 +1,6 @@
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt'); // Añadido
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
@@ -33,7 +34,7 @@ wss.on('connection', (ws, req) => {
 
     ws.on('pong', heartbeat);
 
-    ws.on('message', message => {
+    ws.on('message', async message => { // Añadido async
         const now = Date.now();
         if (now - ws.msgTs > 1000) { 
             ws.msgTs = now; 
@@ -51,7 +52,7 @@ wss.on('connection', (ws, req) => {
             return; 
         }
 
-        if (data.appType === 'cudi-sync') handleSyncLogic(ws, data, messageString);
+        if (data.appType === 'cudi-sync') await handleSyncLogic(ws, data, messageString); // Añadido await
         else if (data.appType === 'cudi-messenger') handleMessengerLogic(ws, data, messageString);
     });
 
@@ -63,16 +64,22 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-function handleSyncLogic(ws, data, messageString) {
+async function handleSyncLogic(ws, data, messageString) { // Añadido async
     switch (data.type) {
         case 'join':
             if (!data.room) return;
 
             if (!syncRooms.has(data.room)) {
+                // Si hay contraseña, la hasheamos
+                let passwordHash = null;
+                if (data.password) {
+                    passwordHash = await bcrypt.hash(data.password, 10);
+                }
+
                 syncRooms.set(data.room, {
                     clients: new Set(),
                     host: ws,
-                    password: data.password || null,
+                    password: passwordHash, // Guardamos el HASH
                     manualApproval: data.manualApproval || false,
                     token: crypto.randomBytes(16).toString('hex'),
                     createdAt: Date.now()
@@ -96,16 +103,23 @@ function handleSyncLogic(ws, data, messageString) {
                 return ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
             }
 
+            // Validación de Token (Prioritaria)
             const isTokenValid = data.token && (data.token === room.token) && (Date.now() - room.createdAt < TOKEN_TTL);
-
             if (isTokenValid) {
                 room.token = null;
                 finalizarUnion(ws, room);
                 return;
             }
 
-            if (room.password && data.password !== room.password) {
-                return ws.send(JSON.stringify({ type: 'error', message: 'Wrong password' }));
+            // Validación de Password (Si la sala tiene)
+            if (room.password) {
+                if (!data.password) {
+                    return ws.send(JSON.stringify({ type: 'error', message: 'Password required' }));
+                }
+                const match = await bcrypt.compare(data.password, room.password);
+                if (!match) {
+                    return ws.send(JSON.stringify({ type: 'error', message: 'Wrong password' }));
+                }
             }
 
             if (room.manualApproval) {
