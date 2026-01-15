@@ -6,14 +6,24 @@ const wss = new WebSocket.Server({ port: PORT });
 
 const appClients = new Map();
 const syncRooms = new Map();
+const connectionsPerIP = new Map();
 
 const MAX_MESSAGE_SIZE = 64 * 1024; 
 const HEARTBEAT_INTERVAL = 30000;
-const TOKEN_TTL = 86400000;
+const TOKEN_TTL = 15 * 60 * 1000;
 
 function heartbeat() { this.isAlive = true; }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+    const ip = req.socket.remoteAddress;
+    const currentIPCount = (connectionsPerIP.get(ip) || 0) + 1;
+    
+    if (currentIPCount > 15) {
+        ws.terminate();
+        return;
+    }
+    connectionsPerIP.set(ip, currentIPCount);
+
     ws.isAlive = true;
     ws.id = crypto.randomBytes(8).toString('hex');
     ws.isPending = false;
@@ -32,7 +42,6 @@ wss.on('connection', (ws) => {
         if (++ws.msgCount > 30) return ws.close(1011);
 
         const messageString = message.toString();
-
         if (messageString.length > MAX_MESSAGE_SIZE) return ws.close(1009);
 
         let data;
@@ -46,7 +55,12 @@ wss.on('connection', (ws) => {
         else if (data.appType === 'cudi-messenger') handleMessengerLogic(ws, data, messageString);
     });
 
-    ws.on('close', () => limpiarRecursos(ws));
+    ws.on('close', () => {
+        const count = connectionsPerIP.get(ip) - 1;
+        if (count <= 0) connectionsPerIP.delete(ip);
+        else connectionsPerIP.set(ip, count);
+        limpiarRecursos(ws);
+    });
 });
 
 function handleSyncLogic(ws, data, messageString) {
@@ -85,6 +99,7 @@ function handleSyncLogic(ws, data, messageString) {
             const isTokenValid = data.token && (data.token === room.token) && (Date.now() - room.createdAt < TOKEN_TTL);
 
             if (isTokenValid) {
+                room.token = null;
                 finalizarUnion(ws, room);
                 return;
             }
@@ -185,6 +200,13 @@ function limpiarRecursos(ws) {
 }
 
 const interval = setInterval(() => {
+    const now = Date.now();
+    syncRooms.forEach((room, roomId) => {
+        if (now - room.createdAt > TOKEN_TTL && room.clients.size === 0) {
+            syncRooms.delete(roomId);
+        }
+    });
+
     wss.clients.forEach(ws => {
         if (!ws.isAlive) return ws.terminate();
         ws.isAlive = false;
