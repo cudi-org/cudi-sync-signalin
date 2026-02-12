@@ -1,6 +1,6 @@
 const WebSocket = require('ws');
 const crypto = require('crypto');
-const bcrypt = require('bcrypt'); // Añadido
+const bcrypt = require('bcrypt');
 
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
@@ -13,13 +13,17 @@ const MAX_MESSAGE_SIZE = 64 * 1024;
 const HEARTBEAT_INTERVAL = 30000;
 const TOKEN_TTL = 15 * 60 * 1000;
 
-function heartbeat() { this.isAlive = true; }
+console.log(`[CUDI-SERVER] Iniciado en puerto ${PORT}. Esperando conexiones...`);
 
 wss.on('connection', (ws, req) => {
-    const ip = req.socket.remoteAddress;
+    // Detectar IP real en Render
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const currentIPCount = (connectionsPerIP.get(ip) || 0) + 1;
     
+    console.log(`[RENDER-NET] Nueva conexión | IP: ${ip} | Activas: ${currentIPCount}`);
+    
     if (currentIPCount > 15) {
+        console.warn(`[SECURITY] Bloqueando IP ${ip} por exceso de conexiones.`);
         ws.terminate();
         return;
     }
@@ -32,27 +36,33 @@ wss.on('connection', (ws, req) => {
     ws.msgCount = 0;
     ws.msgTs = Date.now();
 
-    ws.on('pong', heartbeat);
+    ws.on('pong', () => { ws.isAlive = true; });
 
-    ws.on('message', async message => { // Añadido async
+    ws.on('message', async message => {
         const now = Date.now();
         if (now - ws.msgTs > 1000) { 
             ws.msgTs = now; 
             ws.msgCount = 0; 
         }
-        if (++ws.msgCount > 30) return ws.close(1011);
+        if (++ws.msgCount > 30) {
+            console.warn(`[RATE-LIMIT] Cliente ${ws.id} excedió límite de mensajes.`);
+            return ws.close(1011);
+        }
 
         const messageString = message.toString();
         if (messageString.length > MAX_MESSAGE_SIZE) return ws.close(1009);
 
+        // Log de señalización pesada
+        if (messageString.length > 5000) {
+            console.log(`[DIAG] Mensaje grande (${messageString.length} bytes) de ${ws.id}`);
+        }
+
         let data;
         try { 
             data = JSON.parse(messageString); 
-        } catch (e) { 
-            return; 
-        }
+        } catch (e) { return; }
 
-        if (data.appType === 'cudi-sync') await handleSyncLogic(ws, data, messageString); // Añadido await
+        if (data.appType === 'cudi-sync') await handleSyncLogic(ws, data, messageString);
         else if (data.appType === 'cudi-messenger') handleMessengerLogic(ws, data, messageString);
     });
 
@@ -60,17 +70,18 @@ wss.on('connection', (ws, req) => {
         const count = connectionsPerIP.get(ip) - 1;
         if (count <= 0) connectionsPerIP.delete(ip);
         else connectionsPerIP.set(ip, count);
+        console.log(`[RENDER-NET] Cliente ${ws.id} desconectado.`);
         limpiarRecursos(ws);
     });
 });
 
-async function handleSyncLogic(ws, data, messageString) { // Añadido async
+async function handleSyncLogic(ws, data, messageString) {
     switch (data.type) {
         case 'join':
             if (!data.room) return;
+            console.log(`[SYNC] Intento de unión a sala: ${data.room} por ${ws.id}`);
 
             if (!syncRooms.has(data.room)) {
-                // Si hay contraseña, la hasheamos
                 let passwordHash = null;
                 if (data.password) {
                     passwordHash = await bcrypt.hash(data.password, 10);
@@ -79,7 +90,7 @@ async function handleSyncLogic(ws, data, messageString) { // Añadido async
                 syncRooms.set(data.room, {
                     clients: new Set(),
                     host: ws,
-                    password: passwordHash, // Guardamos el HASH
+                    password: passwordHash,
                     manualApproval: data.manualApproval || false,
                     token: crypto.randomBytes(16).toString('hex'),
                     createdAt: Date.now()
@@ -98,12 +109,10 @@ async function handleSyncLogic(ws, data, messageString) { // Añadido async
             }
 
             const room = syncRooms.get(data.room);
-
             if (room.clients.size >= 2) {
                 return ws.send(JSON.stringify({ type: 'error', message: 'Room is full' }));
             }
 
-            // Validación de Token (Prioritaria)
             const isTokenValid = data.token && (data.token === room.token) && (Date.now() - room.createdAt < TOKEN_TTL);
             if (isTokenValid) {
                 room.token = null;
@@ -111,15 +120,10 @@ async function handleSyncLogic(ws, data, messageString) { // Añadido async
                 return;
             }
 
-            // Validación de Password (Si la sala tiene)
             if (room.password) {
-                if (!data.password) {
-                    return ws.send(JSON.stringify({ type: 'error', message: 'Password required' }));
-                }
+                if (!data.password) return ws.send(JSON.stringify({ type: 'error', message: 'Password required' }));
                 const match = await bcrypt.compare(data.password, room.password);
-                if (!match) {
-                    return ws.send(JSON.stringify({ type: 'error', message: 'Wrong password' }));
-                }
+                if (!match) return ws.send(JSON.stringify({ type: 'error', message: 'Wrong password' }));
             }
 
             if (room.manualApproval) {
@@ -153,6 +157,12 @@ async function handleSyncLogic(ws, data, messageString) { // Añadido async
 
         case 'signal':
             if (!ws.room || ws.isPending || !syncRooms.has(ws.room)) return;
+            
+            // Log de diagnóstico ICE
+            if (data.candidate && data.candidate.candidate.includes('relay')) {
+                console.log(`[DIAG] Posible bloqueo ISP en sala ${ws.room}: Usando RELAY (TURN).`);
+            }
+
             const rData = syncRooms.get(ws.room);
             rData.clients.forEach(client => {
                 if (client !== ws && !client.isPending && client.readyState === WebSocket.OPEN) {
